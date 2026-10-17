@@ -2731,7 +2731,7 @@ export function App() {
     }
   };
 
-  const syncProvidersNow = async () => {
+  const syncProvidersNow = async (targetProviderOverride?: string) => {
     if (sessionIndexRepairRunning.current) return;
     if (providerSyncProgress.active) return;
     setProviderSyncProgress({
@@ -2771,7 +2771,7 @@ export function App() {
           };
         });
       });
-      const targetProvider = selectedProviderSyncTarget || undefined;
+      const targetProvider = targetProviderOverride?.trim() || selectedProviderSyncTarget || undefined;
       const result = await run(() =>
         call<CommandResult<ProviderSyncPayload>>("sync_providers_now", { targetProvider }),
       );
@@ -2869,6 +2869,26 @@ export function App() {
     } finally {
       unlisten?.();
     }
+  };
+
+  const syncHistoryAfterProviderSwitch = async (targetProvider: string) => {
+    if (!settingsForm.providerSyncEnabled) return;
+    if (codexAppRunning) {
+      const restartNow = window.confirm(
+        t("供应商已切换，但 Codex 正在运行。历史会话修复必须在 Codex 完全退出后进行。现在重启并修复吗？"),
+      );
+      if (restartNow) {
+        await restart(true);
+      } else {
+        showNotice(
+          t("供应商切换"),
+          t("供应商已切换；历史会话尚未修复。请完全退出并重启 Codex，或手动修复历史会话。"),
+          "degraded",
+        );
+      }
+      return;
+    }
+    await syncProvidersNow(targetProvider);
   };
 
   const applyRelayInjection = async (silent = false) => {
@@ -3117,6 +3137,9 @@ export function App() {
         targetRelayId: currentSelected.id,
         status: result.status,
       });
+      if (previousActiveRelayId !== currentSelected.id) {
+        await syncHistoryAfterProviderSwitch(relaySessionProvider(currentSelected));
+      }
     } finally {
       setRelaySwitching(false);
     }

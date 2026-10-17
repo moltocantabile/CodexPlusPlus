@@ -2312,44 +2312,65 @@ enum ResponseItemRewrite {
     Drop,
 }
 
-fn reasoning_item_has_plaintext_summary(item: &Value) -> bool {
-    item.get("summary")
-        .and_then(Value::as_array)
-        .is_some_and(|summary| {
-            summary.iter().any(|part| {
-                part.get("text")
-                    .or_else(|| part.get("content"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-            })
-        })
+fn is_encrypted_replay_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("reasoning") | Some("compaction") | Some("context_compaction")
+    )
+}
+
+fn encrypted_replay_item_has_content(item: &Value) -> bool {
+    is_encrypted_replay_item(item)
+        && item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty())
 }
 
 fn rewrite_response_item(
     item: &mut Value,
     strip_foreign_encrypted_reasoning: bool,
 ) -> ResponseItemRewrite {
-    let is_reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning");
-    let has_encrypted_content = item
-        .get("encrypted_content")
-        .and_then(Value::as_str)
-        .is_some_and(|content| !content.is_empty());
-    if strip_foreign_encrypted_reasoning && is_reasoning && has_encrypted_content {
-        if reasoning_item_has_plaintext_summary(item) {
-            if let Some(object) = item.as_object_mut() {
-                object.remove("encrypted_content");
-            }
-        } else {
-            return ResponseItemRewrite::Drop;
-        }
-        rewrite_response_item_id(item);
-        return ResponseItemRewrite::Rewritten;
+    if strip_foreign_encrypted_reasoning
+        && encrypted_replay_item_has_content(item)
+    {
+        // `encrypted_content` is an integrity-bound replay payload. Removing only
+        // the field leaves a summary-only reasoning/compaction item which the
+        // Responses schema may reject as missing the required encrypted payload.
+        // The visible summary is not a substitute for the replay item, so drop
+        // the complete response item.
+        return ResponseItemRewrite::Drop;
     }
     if rewrite_response_item_id(item) {
         ResponseItemRewrite::Rewritten
     } else {
         ResponseItemRewrite::Unchanged
     }
+}
+
+fn compacted_record_has_encrypted_replay(record: &Value) -> bool {
+    record
+        .get("type")
+        .and_then(Value::as_str)
+        == Some("compacted")
+        && record
+            .get("payload")
+            .and_then(|payload| payload.get("replacement_history"))
+            .and_then(Value::as_array)
+            .is_some_and(|history| history.iter().any(encrypted_replay_item_has_content))
+}
+
+fn drop_encrypted_replay_items_from_compacted_record(record: &mut Value) -> bool {
+    let Some(history) = record
+        .get_mut("payload")
+        .and_then(|payload| payload.get_mut("replacement_history"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    let original_len = history.len();
+    history.retain(|item| !encrypted_replay_item_has_content(item));
+    history.len() != original_len
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -2400,17 +2421,11 @@ fn scan_bulk_rollout(
                 let needs_rewrite = response_item_id_needs_rewrite(payload);
                 facts.history_item_ids_need_rewrite |= needs_rewrite;
                 facts.rewrite_needed |= needs_rewrite;
-                facts.has_encrypted_reasoning |= payload
-                    .get("type")
-                    .and_then(Value::as_str)
-                    == Some("reasoning")
-                    && payload
-                        .get("encrypted_content")
-                        .and_then(Value::as_str)
-                        .is_some_and(|content| !content.is_empty());
+                facts.has_encrypted_reasoning |= encrypted_replay_item_has_content(payload);
             }
             continue;
         }
+        facts.has_encrypted_reasoning |= compacted_record_has_encrypted_replay(&record);
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
@@ -2448,8 +2463,7 @@ fn hash_bulk_rollout_plan(
     // revalidate all scan facts while hashing, including metadata late in a file.
     reader.seek(SeekFrom::Start(0))?;
     let (mut actual, digest) = scan_bulk_rollout(reader, target_provider, parse_record, true)?;
-    actual.foreign_encrypted_reasoning_need_rewrite = target_provider == DEFAULT_PROVIDER
-        && actual.has_encrypted_reasoning
+    actual.foreign_encrypted_reasoning_need_rewrite = actual.has_encrypted_reasoning
         && (actual
             .providers
             .iter()
@@ -2567,8 +2581,7 @@ fn scan_bulk_session_rewrites_with_parser(
         let historical_source_is_foreign = historical_source_providers
             .get(path)
             .is_some_and(|provider| provider != target_provider);
-        facts.foreign_encrypted_reasoning_need_rewrite = target_provider == DEFAULT_PROVIDER
-            && facts.has_encrypted_reasoning
+        facts.foreign_encrypted_reasoning_need_rewrite = facts.has_encrypted_reasoning
             && (current_source_is_foreign || historical_source_is_foreign);
         facts.rewrite_needed |= facts.foreign_encrypted_reasoning_need_rewrite;
         let is_explicit_user = facts.thread_id
@@ -4482,6 +4495,10 @@ fn stream_rewrite_rollout_session_meta_providers<W: Write>(
             {
                 payload.insert("model_provider".to_string(), json!(target_provider));
                 rewritten = true;
+            } else if strip_foreign_encrypted_reasoning
+                && compacted_record_has_encrypted_replay(&record)
+            {
+                rewritten = drop_encrypted_replay_items_from_compacted_record(&mut record);
             } else if record.get("type").and_then(Value::as_str) == Some("response_item")
                 && let Some(payload) = record.get_mut("payload")
             {
@@ -6393,7 +6410,7 @@ mod startup_scan_tests {
     }
 
     #[test]
-    fn foreign_encrypted_reasoning_is_dropped_or_kept_as_plaintext_summary() {
+    fn foreign_encrypted_replay_items_are_dropped_as_a_whole() {
         let mut opaque = json!({
             "type": "reasoning",
             "id": "rs_reasoning",
@@ -6413,11 +6430,36 @@ mod startup_scan_tests {
         });
         assert_eq!(
             rewrite_response_item(&mut summarized, true),
-            ResponseItemRewrite::Rewritten
+            ResponseItemRewrite::Drop
         );
-        assert_eq!(summarized["id"], "rs_reasoning");
-        assert!(summarized.get("encrypted_content").is_none());
+        assert_eq!(summarized["id"], "item_reasoning");
+        assert_eq!(summarized["encrypted_content"], "foreign-ciphertext");
         assert_eq!(summarized["summary"][0]["text"], "可复用的摘要");
+
+        for item_type in ["compaction", "context_compaction"] {
+            let mut item = json!({
+                "type": item_type,
+                "id": "item_compaction",
+                "encrypted_content": "foreign-ciphertext",
+            });
+            assert_eq!(
+                rewrite_response_item(&mut item, true),
+                ResponseItemRewrite::Drop
+            );
+        }
+
+        let mut compacted = json!({
+            "type": "compacted",
+            "payload": {
+                "replacement_history": [
+                    {"type":"message", "id":"msg_visible"},
+                    {"type":"compaction", "id":"cmp_foreign", "encrypted_content":"foreign-ciphertext"}
+                ]
+            }
+        });
+        assert!(compacted_record_has_encrypted_replay(&compacted));
+        assert!(drop_encrypted_replay_items_from_compacted_record(&mut compacted));
+        assert_eq!(compacted["payload"]["replacement_history"].as_array().unwrap().len(), 1);
 
         let mut official = json!({
             "type": "reasoning",

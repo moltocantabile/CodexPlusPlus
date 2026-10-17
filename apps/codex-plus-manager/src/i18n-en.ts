@@ -695,6 +695,10 @@ export const EN_PLAIN: Record<string, string> = {
   "内置和用户自定义拓展清单": "Built-in and user-defined extension inventory",
   "切换 thread 时恢复上一次浏览位置。": "Restore the last scroll position when switching threads.",
   "切换中": "Switching",
+  "供应商已切换，但 Codex 正在运行。历史会话修复必须在 Codex 完全退出后进行。现在重启并修复吗？":
+    "The provider changed, but Codex is still running. Historical session repair requires Codex to exit completely. Restart and repair now?",
+  "供应商已切换；历史会话尚未修复。请完全退出并重启 Codex，或手动修复历史会话。":
+    "The provider changed, but historical sessions have not been repaired. Fully quit and restart Codex, or repair historical sessions manually.",
   "切换主题": "Toggle theme",
   "切换到此供应商时会写入 Codex 主目录的 auth.json": "Switching to this provider writes auth.json under the Codex home directory",
   "切换到此供应商时会写入的预览；上下文开关变化会立即反映": "Preview of what gets written when switching to this provider; context toggles are reflected immediately",
