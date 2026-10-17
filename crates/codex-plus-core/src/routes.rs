@@ -801,6 +801,7 @@ fn settings_payload_value(
     mut settings: BackendSettings,
     codex_app_version: String,
 ) -> anyhow::Result<Value> {
+    let managed_session_connection = managed_session_connection(&settings);
     let active_relay_session_provider = settings.active_relay_session_provider();
     let active_relay_codex_provider = crate::model_catalog::codex_model_provider_for_relay_profile(
         &crate::relay_config::default_codex_home_dir(),
@@ -808,6 +809,23 @@ fn settings_payload_value(
     );
     settings.dictation = crate::dictation::effective_settings(&settings);
     let mut value = serde_json::to_value(settings)?;
+    fn remove_named_keys(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                object.remove("apiKeys");
+                for child in object.values_mut() {
+                    remove_named_keys(child);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    remove_named_keys(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    remove_named_keys(&mut value);
     if let Some(object) = value.as_object_mut() {
         object.remove("codexAppStepwiseApiKey");
         if let Some(dictation) = object.get_mut("dictation").and_then(Value::as_object_mut) {
@@ -817,6 +835,10 @@ fn settings_payload_value(
                 .unwrap_or(false);
             dictation.insert("apiKeyConfigured".to_string(), json!(configured));
         }
+        object.insert(
+            "managedSessionConnection".to_string(),
+            managed_session_connection,
+        );
         object.insert(
             "activeRelaySessionProvider".to_string(),
             Value::String(active_relay_session_provider.as_str().to_string()),
@@ -833,9 +855,81 @@ fn settings_payload_value(
     Ok(value)
 }
 
+fn managed_session_connection(settings: &BackendSettings) -> Value {
+    // 固定所有自定义会话聚合的本地传输，模型聚合与故障转移共用这一入口。
+    // 不要把成员的真实认证信息下发给 renderer。
+    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
+        return Value::Null;
+    };
+    if !settings.relay_profiles_enabled
+        || aggregate.session_provider != crate::settings::RelaySessionProvider::Custom
+        || aggregate.sync_default_member_login
+    {
+        return Value::Null;
+    }
+    json!({
+        "profileId": settings.active_relay_id,
+        "provider": "codex_plus_managed",
+        "baseUrl": crate::protocol_proxy::local_responses_proxy_base_url(
+            crate::protocol_proxy::protocol_proxy_port()
+        ),
+    })
+}
+
 #[cfg(test)]
 mod dictation_privacy_tests {
     use super::*;
+
+    #[test]
+    fn managed_session_connection_uses_settings_and_local_proxy_only() {
+        use crate::settings::{AggregateRelayProfile, RelayMode, RelayProfile, RelaySessionProvider};
+        let mut settings = BackendSettings {
+            relay_profiles_enabled: true,
+            active_relay_id: "aggregate".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "aggregate".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            }],
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "aggregate".to_string(),
+                name: String::new(),
+                session_provider: RelaySessionProvider::Custom,
+                model_aggregation_enabled: true,
+                strategy: Default::default(),
+                members: Vec::new(),
+                routes: Vec::new(),
+                default_relay_id: String::new(),
+                sync_default_member_login: false,
+            }],
+            ..BackendSettings::default()
+        };
+        let connection = managed_session_connection(&settings);
+        assert_eq!(connection["profileId"], "aggregate");
+        assert_eq!(connection["provider"], "codex_plus_managed");
+        assert_eq!(
+            connection["baseUrl"],
+            crate::protocol_proxy::local_responses_proxy_base_url(
+                crate::protocol_proxy::protocol_proxy_port()
+            )
+        );
+        assert_eq!(connection.as_object().unwrap().len(), 3);
+        // 模型聚合开关、故障转移策略及默认选择不改变本地会话连接地址。
+        settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
+        settings.aggregate_relay_profiles[0].strategy =
+            crate::settings::AggregateRelayStrategy::Failover;
+        settings.aggregate_relay_profiles[0].default_relay_id = "new-default".to_string();
+        settings.relay_profiles[0].model = "new-model".to_string();
+        assert_eq!(managed_session_connection(&settings), connection);
+        settings.aggregate_relay_profiles[0].sync_default_member_login = true;
+        assert!(managed_session_connection(&settings).is_null());
+        settings.aggregate_relay_profiles[0].sync_default_member_login = false;
+        settings.aggregate_relay_profiles[0].session_provider = RelaySessionProvider::Openai;
+        assert!(managed_session_connection(&settings).is_null());
+        settings.aggregate_relay_profiles[0].session_provider = RelaySessionProvider::Custom;
+        settings.relay_profiles_enabled = false;
+        assert!(managed_session_connection(&settings).is_null());
+    }
 
     #[test]
     fn settings_bridge_preserves_session_share_choice_for_renderer_master_gating() {
@@ -859,6 +953,17 @@ mod dictation_privacy_tests {
         assert!(result["dictation"].get("apiKey").is_none());
         assert_eq!(result["dictation"]["apiKeyConfigured"], true);
         assert!(!result.to_string().contains("fake-asr-private-key"));
+    }
+
+    #[test]
+    fn settings_bridge_never_returns_named_key_lists() {
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles[0].api_keys = vec![crate::settings::RelayApiKey {
+            id: "backup".into(), name: "备用".into(), api_key: "fake-backup-secret".into(),
+        }];
+        let result = settings_payload_value(settings, String::new()).unwrap();
+        assert!(result["relayProfiles"][0].get("apiKeys").is_none());
+        assert!(!result.to_string().contains("fake-backup-secret"));
     }
     #[test]
     fn dictation_settings_bridge_applies_enhancement_switch_without_mutating_settings() {
