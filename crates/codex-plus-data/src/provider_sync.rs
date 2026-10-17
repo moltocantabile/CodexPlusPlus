@@ -408,6 +408,7 @@ struct BulkSessionRewritePlan {
     original_mtime: Option<SystemTime>,
     original_session_meta_lines: Vec<String>,
     history_item_ids_need_rewrite: bool,
+    foreign_encrypted_reasoning_need_rewrite: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -443,6 +444,13 @@ struct AppliedBulkSessionRewrites {
 struct SessionMetaBackupEntry<'a> {
     path: String,
     original_session_meta_lines: &'a [String],
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnedSessionMetaBackupEntry {
+    path: String,
+    original_session_meta_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2297,6 +2305,53 @@ fn rewrite_response_item_id(item: &mut Value) -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseItemRewrite {
+    Unchanged,
+    Rewritten,
+    Drop,
+}
+
+fn reasoning_item_has_plaintext_summary(item: &Value) -> bool {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .is_some_and(|summary| {
+            summary.iter().any(|part| {
+                part.get("text")
+                    .or_else(|| part.get("content"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            })
+        })
+}
+
+fn rewrite_response_item(
+    item: &mut Value,
+    strip_foreign_encrypted_reasoning: bool,
+) -> ResponseItemRewrite {
+    let is_reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning");
+    let has_encrypted_content = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| !content.is_empty());
+    if strip_foreign_encrypted_reasoning && is_reasoning && has_encrypted_content {
+        if reasoning_item_has_plaintext_summary(item) {
+            if let Some(object) = item.as_object_mut() {
+                object.remove("encrypted_content");
+            }
+        } else {
+            return ResponseItemRewrite::Drop;
+        }
+        rewrite_response_item_id(item);
+        return ResponseItemRewrite::Rewritten;
+    }
+    if rewrite_response_item_id(item) {
+        ResponseItemRewrite::Rewritten
+    } else {
+        ResponseItemRewrite::Unchanged
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct BulkRolloutFacts {
     session_meta_count: usize,
@@ -2308,7 +2363,9 @@ struct BulkRolloutFacts {
     rollout_marks_non_root_agent: bool,
     has_user_event: bool,
     has_encrypted_content: bool,
+    has_encrypted_reasoning: bool,
     history_item_ids_need_rewrite: bool,
+    foreign_encrypted_reasoning_need_rewrite: bool,
 }
 
 fn scan_bulk_rollout(
@@ -2343,6 +2400,14 @@ fn scan_bulk_rollout(
                 let needs_rewrite = response_item_id_needs_rewrite(payload);
                 facts.history_item_ids_need_rewrite |= needs_rewrite;
                 facts.rewrite_needed |= needs_rewrite;
+                facts.has_encrypted_reasoning |= payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    == Some("reasoning")
+                    && payload
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| !content.is_empty());
             }
             continue;
         }
@@ -2377,13 +2442,78 @@ fn hash_bulk_rollout_plan(
     target_provider: &str,
     parse_record: &impl Fn(&str) -> Option<Value>,
     expected: &BulkRolloutFacts,
+    historical_source_is_foreign: bool,
 ) -> anyhow::Result<String> {
     // A write plan still needs an exact preimage. Rewind the same handle and
     // revalidate all scan facts while hashing, including metadata late in a file.
     reader.seek(SeekFrom::Start(0))?;
-    let (actual, digest) = scan_bulk_rollout(reader, target_provider, parse_record, true)?;
+    let (mut actual, digest) = scan_bulk_rollout(reader, target_provider, parse_record, true)?;
+    actual.foreign_encrypted_reasoning_need_rewrite = target_provider == DEFAULT_PROVIDER
+        && actual.has_encrypted_reasoning
+        && (actual
+            .providers
+            .iter()
+            .any(|provider| provider != target_provider)
+            || historical_source_is_foreign);
+    actual.rewrite_needed |= actual.foreign_encrypted_reasoning_need_rewrite;
     anyhow::ensure!(actual == *expected, "Rollout changed while planning provider sync");
     digest.ok_or_else(|| anyhow::anyhow!("Missing rollout source hash"))
+}
+
+/// Provider sync rewrites `session_meta` in place. For a later repair pass, the
+/// managed backup is the only durable record of which provider produced a
+/// rollout that already says `openai`.
+fn historical_rollout_source_providers(home: &Path) -> anyhow::Result<HashMap<PathBuf, String>> {
+    let root = home.join("backups_state/provider-sync");
+    let mut backup_dirs = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    backup_dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+
+    let mut providers = HashMap::new();
+    for backup_dir in backup_dirs {
+        let metadata = fs::read_to_string(backup_dir.join("metadata.json")).ok();
+        if metadata
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|value| value.get("managedBy").and_then(Value::as_str).map(str::to_owned))
+            .as_deref()
+            != Some("Codex++ provider sync")
+        {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(backup_dir.join("session-meta-backup.json")) else {
+            continue;
+        };
+        let Ok(entries) = serde_json::from_str::<Vec<OwnedSessionMetaBackupEntry>>(&text) else {
+            continue;
+        };
+        for entry in entries {
+            let path = PathBuf::from(entry.path);
+            if providers.contains_key(&path) {
+                continue;
+            }
+            let Some(provider) = entry.original_session_meta_lines.iter().find_map(|line| {
+                let record = serde_json::from_str::<Value>(line).ok()?;
+                (record.get("type").and_then(Value::as_str) == Some("session_meta"))
+                    .then(|| {
+                        record
+                            .get("payload")
+                            .and_then(|payload| payload.get("model_provider"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .flatten()
+            }) else {
+                continue;
+            };
+            providers.insert(path, provider);
+        }
+    }
+    Ok(providers)
 }
 
 fn scan_bulk_session_rewrites_with_parser(
@@ -2396,6 +2526,7 @@ fn scan_bulk_session_rewrites_with_parser(
     hash_all_sources: bool,
 ) -> anyhow::Result<BulkSessionScan> {
     let paths = rollout_files(home)?;
+    let historical_source_providers = historical_rollout_source_providers(home)?;
     let mut scan = BulkSessionScan {
         total_rollout_files: paths.len(),
         ..Default::default()
@@ -2427,8 +2558,19 @@ fn scan_bulk_session_rewrites_with_parser(
         };
 
         let mut reader = BufReader::with_capacity(64 * 1024, file);
-        let (facts, mut original_sha256) =
+        let (mut facts, mut original_sha256) =
             scan_bulk_rollout(&mut reader, target_provider, &parse_record, hash_all_sources)?;
+        let current_source_is_foreign = facts
+            .providers
+            .iter()
+            .any(|provider| provider != target_provider);
+        let historical_source_is_foreign = historical_source_providers
+            .get(path)
+            .is_some_and(|provider| provider != target_provider);
+        facts.foreign_encrypted_reasoning_need_rewrite = target_provider == DEFAULT_PROVIDER
+            && facts.has_encrypted_reasoning
+            && (current_source_is_foreign || historical_source_is_foreign);
+        facts.rewrite_needed |= facts.foreign_encrypted_reasoning_need_rewrite;
         let is_explicit_user = facts.thread_id
             .as_ref()
             .is_some_and(|id| explicit_user_thread_ids.contains(id));
@@ -2438,13 +2580,19 @@ fn scan_bulk_session_rewrites_with_parser(
                 .is_some_and(|id| excluded_thread_ids.contains(id)));
         if facts.rewrite_needed && !excluded && original_sha256.is_none() {
             original_sha256 = Some(hash_bulk_rollout_plan(
-                &mut reader, target_provider, &parse_record, &facts,
+                &mut reader,
+                target_provider,
+                &parse_record,
+                &facts,
+                historical_source_is_foreign,
             )?);
         }
         let BulkRolloutFacts {
             session_meta_count, thread_id, cwd, providers, original_session_meta_lines,
             rewrite_needed, rollout_marks_non_root_agent, has_user_event, has_encrypted_content,
+            has_encrypted_reasoning: _,
             history_item_ids_need_rewrite,
+            foreign_encrypted_reasoning_need_rewrite,
         } = facts;
 
         if session_meta_count > 0 {
@@ -2488,6 +2636,7 @@ fn scan_bulk_session_rewrites_with_parser(
                             .ok(),
                         original_session_meta_lines,
                         history_item_ids_need_rewrite,
+                        foreign_encrypted_reasoning_need_rewrite,
                     });
                 }
             }
@@ -4041,7 +4190,9 @@ fn create_bulk_backup(
     )?;
     for plan in rewrite_plans
         .iter()
-        .filter(|plan| plan.history_item_ids_need_rewrite)
+        .filter(|plan| {
+            plan.history_item_ids_need_rewrite || plan.foreign_encrypted_reasoning_need_rewrite
+        })
     {
         let relative = codex_plus_core::codex_sqlite::relative_to_codex_home(home, &plan.path);
         let target = backup_dir.join("rollouts").join(relative);
@@ -4198,7 +4349,9 @@ fn apply_bulk_session_rewrite_plans(
                 applied.changes.push(AppliedBulkSessionRewrite {
                     plan: plan.clone(),
                     rewritten_sha256,
-                    full_backup_path: plan.history_item_ids_need_rewrite.then(|| {
+                    full_backup_path: (plan.history_item_ids_need_rewrite
+                        || plan.foreign_encrypted_reasoning_need_rewrite)
+                        .then(|| {
                         backup_dir
                             .join("rollouts")
                             .join(codex_plus_core::codex_sqlite::relative_to_codex_home(
@@ -4283,6 +4436,7 @@ fn rewrite_bulk_session_plan(
         let source_sha256 = stream_rewrite_rollout_session_meta_providers(
             &plan.path,
             target_provider,
+            plan.foreign_encrypted_reasoning_need_rewrite,
             &mut writer,
         )?;
         writer.flush()?;
@@ -4303,6 +4457,7 @@ fn rewrite_bulk_session_plan(
 fn stream_rewrite_rollout_session_meta_providers<W: Write>(
     path: &Path,
     target_provider: &str,
+    strip_foreign_encrypted_reasoning: bool,
     writer: &mut W,
 ) -> std::io::Result<String> {
     let file = File::open(path)?;
@@ -4317,6 +4472,7 @@ fn stream_rewrite_rollout_session_meta_providers<W: Write>(
         hasher.update(line.as_bytes());
         let (record_line, line_ending) = split_line_ending(&line);
         let mut rewritten = false;
+        let mut drop_record = false;
         if !record_line.trim().is_empty()
             && let Ok(mut record) = serde_json::from_str::<Value>(record_line)
         {
@@ -4329,14 +4485,18 @@ fn stream_rewrite_rollout_session_meta_providers<W: Write>(
             } else if record.get("type").and_then(Value::as_str) == Some("response_item")
                 && let Some(payload) = record.get_mut("payload")
             {
-                rewritten = rewrite_response_item_id(payload);
+                match rewrite_response_item(payload, strip_foreign_encrypted_reasoning) {
+                    ResponseItemRewrite::Unchanged => {}
+                    ResponseItemRewrite::Rewritten => rewritten = true,
+                    ResponseItemRewrite::Drop => drop_record = true,
+                }
             }
-            if rewritten {
+            if rewritten && !drop_record {
                 serde_json::to_writer(&mut *writer, &record).map_err(std::io::Error::other)?;
                 writer.write_all(line_ending.as_bytes())?;
             }
         }
-        if !rewritten {
+        if !rewritten && !drop_record {
             writer.write_all(line.as_bytes())?;
         }
     }
@@ -6233,6 +6393,46 @@ mod startup_scan_tests {
     }
 
     #[test]
+    fn foreign_encrypted_reasoning_is_dropped_or_kept_as_plaintext_summary() {
+        let mut opaque = json!({
+            "type": "reasoning",
+            "id": "rs_reasoning",
+            "summary": [],
+            "encrypted_content": "foreign-ciphertext",
+        });
+        assert_eq!(
+            rewrite_response_item(&mut opaque, true),
+            ResponseItemRewrite::Drop
+        );
+
+        let mut summarized = json!({
+            "type": "reasoning",
+            "id": "item_reasoning",
+            "summary": [{"type":"summary_text","text":"可复用的摘要"}],
+            "encrypted_content": "foreign-ciphertext",
+        });
+        assert_eq!(
+            rewrite_response_item(&mut summarized, true),
+            ResponseItemRewrite::Rewritten
+        );
+        assert_eq!(summarized["id"], "rs_reasoning");
+        assert!(summarized.get("encrypted_content").is_none());
+        assert_eq!(summarized["summary"][0]["text"], "可复用的摘要");
+
+        let mut official = json!({
+            "type": "reasoning",
+            "id": "rs_official",
+            "summary": [],
+            "encrypted_content": "official-ciphertext",
+        });
+        assert_eq!(
+            rewrite_response_item(&mut official, false),
+            ResponseItemRewrite::Unchanged
+        );
+        assert_eq!(official["encrypted_content"], "official-ciphertext");
+    }
+
+    #[test]
     fn bulk_parser_selects_session_meta_and_response_items_only() {
         let response = r#"{"type":"response_item","payload":{"type":"message","id":"item_1"}}"#;
         assert!(parse_bulk_rewrite_record(response).is_some());
@@ -6334,6 +6534,77 @@ mod startup_scan_tests {
     }
 
     #[test]
+    fn scan_detects_foreign_encrypted_reasoning_when_switching_to_official() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-history.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"thread-1","model_provider":"custom"}}),
+                json!({"type":"response_item","payload":{"type":"reasoning","id":"rs_foreign","summary":[],"encrypted_content":"foreign-ciphertext"}}),
+            ),
+        )
+        .unwrap();
+
+        let scan = scan_bulk_session_rewrites(
+            temp.path(),
+            "openai",
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(scan.rewrite_plans.len(), 1);
+        assert!(scan.rewrite_plans[0].foreign_encrypted_reasoning_need_rewrite);
+    }
+
+    #[test]
+    fn scan_uses_backup_provider_to_repair_already_migrated_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let rollout = sessions.join("rollout-history.jsonl");
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"thread-1","model_provider":"openai"}}),
+                json!({"type":"response_item","payload":{"type":"reasoning","id":"rs_foreign","summary":[],"encrypted_content":"foreign-ciphertext"}}),
+            ),
+        )
+        .unwrap();
+        let backup = temp.path().join("backups_state/provider-sync/20261017192011");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(
+            backup.join("metadata.json"),
+            json!({"managedBy":"Codex++ provider sync"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            backup.join("session-meta-backup.json"),
+            json!([{
+                "path": rollout,
+                "originalSessionMetaLines": [json!({"type":"session_meta","payload":{"id":"thread-1","model_provider":"custom"}}).to_string()]
+            }])
+            .to_string(),
+        )
+        .unwrap();
+
+        let scan = scan_bulk_session_rewrites(
+            temp.path(),
+            "openai",
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(scan.rewrite_plans.len(), 1);
+        assert!(scan.rewrite_plans[0].foreign_encrypted_reasoning_need_rewrite);
+    }
+
+    #[test]
     fn stream_rewrite_migrates_history_ids_and_preserves_opaque_payloads() {
         let temp = tempfile::tempdir().unwrap();
         let rollout = temp.path().join("rollout.jsonl");
@@ -6345,7 +6616,8 @@ mod startup_scan_tests {
         fs::write(&rollout, original).unwrap();
 
         let mut rewritten = Vec::new();
-        stream_rewrite_rollout_session_meta_providers(&rollout, "openai", &mut rewritten).unwrap();
+        stream_rewrite_rollout_session_meta_providers(&rollout, "openai", false, &mut rewritten)
+            .unwrap();
         let lines = String::from_utf8(rewritten).unwrap();
         let records = lines
             .lines()
@@ -6355,6 +6627,37 @@ mod startup_scan_tests {
         assert_eq!(records[1]["payload"]["id"], "msg_message");
         assert_eq!(records[1]["payload"]["call_id"], "call_1");
         assert_eq!(records[1]["payload"]["content"][0]["data"], "opaque");
+    }
+
+    #[test]
+    fn stream_rewrite_drops_foreign_reasoning_without_a_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp.path().join("rollout.jsonl");
+        let original = format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"thread-1","model_provider":"custom"}}),
+            json!({"type":"response_item","payload":{"type":"reasoning","id":"rs_foreign","summary":[],"encrypted_content":"foreign-ciphertext"}}),
+            json!({"type":"response_item","payload":{"type":"message","id":"msg_message","content":[{"type":"input_text","text":"保留"}]}}),
+        );
+        fs::write(&rollout, original).unwrap();
+
+        let mut rewritten = Vec::new();
+        stream_rewrite_rollout_session_meta_providers(&rollout, "openai", true, &mut rewritten)
+            .unwrap();
+        let records = String::from_utf8(rewritten)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| {
+            record
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                != Some("reasoning")
+        }));
+        assert_eq!(records[1]["payload"]["id"], "msg_message");
     }
 
     #[test]
@@ -6372,7 +6675,14 @@ mod startup_scan_tests {
         assert!(facts.rewrite_needed);
         assert_eq!(facts.session_meta_count, 2);
         assert!(digest.is_none());
-        let digest = hash_bulk_rollout_plan(&mut reader, "new", &parse_session_meta_record, &facts).unwrap();
+        let digest = hash_bulk_rollout_plan(
+            &mut reader,
+            "new",
+            &parse_session_meta_record,
+            &facts,
+            false,
+        )
+        .unwrap();
         assert_eq!(digest, format!("{:x}", Sha256::digest(&bytes)));
     }
 
@@ -6387,7 +6697,14 @@ mod startup_scan_tests {
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"t\",\"model_provider\":\"old\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\"}}\n",
         ] {
             let mut reader = std::io::Cursor::new(changed.as_bytes());
-            let error = hash_bulk_rollout_plan(&mut reader, "new", &parse_session_meta_record, &facts).unwrap_err();
+            let error = hash_bulk_rollout_plan(
+                &mut reader,
+                "new",
+                &parse_session_meta_record,
+                &facts,
+                false,
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("Rollout changed while planning"));
         }
     }
@@ -6619,6 +6936,7 @@ mod rollback_tests {
                 original_mtime: None,
                 original_session_meta_lines: vec![incorrect_meta.to_string()],
                 history_item_ids_need_rewrite: false,
+                foreign_encrypted_reasoning_need_rewrite: false,
             },
             rewritten_sha256,
             full_backup_path: None,
