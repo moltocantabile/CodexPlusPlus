@@ -407,6 +407,7 @@ struct BulkSessionRewritePlan {
     original_sha256: String,
     original_mtime: Option<SystemTime>,
     original_session_meta_lines: Vec<String>,
+    history_item_ids_need_rewrite: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -428,6 +429,7 @@ struct BulkSessionScan {
 struct AppliedBulkSessionRewrite {
     plan: BulkSessionRewritePlan,
     rewritten_sha256: String,
+    full_backup_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -1133,6 +1135,8 @@ where
         let backup_dir = create_bulk_backup(&home, &target_provider, &rewrite_plans)?;
         let applied = apply_bulk_session_rewrite_plans(
             &rewrite_plans,
+            &backup_dir,
+            &home,
             &target_provider,
             total_rollout_files,
             scanned_skipped_rollout_files.len(),
@@ -2185,7 +2189,7 @@ fn scan_bulk_session_rewrites(
         excluded_thread_ids,
         explicit_user_thread_ids,
         report_progress,
-        parse_session_meta_record,
+        parse_bulk_rewrite_record,
         false,
     )
 }
@@ -2217,6 +2221,82 @@ fn parse_session_meta_record(line: &str) -> Option<Value> {
     serde_json::from_str(line).ok()
 }
 
+fn parse_bulk_rewrite_record(line: &str) -> Option<Value> {
+    let envelope = match serde_json::from_str::<BulkRolloutEnvelope<'_>>(line) {
+        Ok(envelope) => envelope,
+        // Derived structs reject duplicate fields, whereas Value keeps the last one.
+        Err(_) => {
+            return serde_json::from_str::<Value>(line).ok().filter(|record| {
+                matches!(
+                    record.get("type").and_then(Value::as_str),
+                    Some("session_meta" | "response_item")
+                )
+            });
+        }
+    };
+    let kind = envelope.kind?.get().trim();
+    let kind = if kind.contains('\\') {
+        serde_json::from_str::<String>(kind).ok()?
+    } else {
+        kind.trim_matches('"').to_string()
+    };
+    match kind.as_str() {
+        "session_meta" => parse_session_meta_record(line),
+        "response_item" => serde_json::from_str(line).ok(),
+        _ => None,
+    }
+}
+
+fn responses_history_item_prefix(item_type: &str) -> Option<&'static str> {
+    // Keep this in lockstep with protocol_proxy's outbound normalizer. Unknown
+    // item types are intentionally left untouched because their upstream ID
+    // contract is not established here.
+    match item_type {
+        "message" => Some("msg_"),
+        "reasoning" => Some("rs_"),
+        "compaction" => Some("cmp_"),
+        "function_call" => Some("fc_"),
+        "function_call_output" => Some("fco_"),
+        "custom_tool_call" => Some("ctc_"),
+        "custom_tool_call_output" => Some("ctco_"),
+        _ => None,
+    }
+}
+
+fn canonical_history_item_id(item: &Value) -> Option<String> {
+    let object = item.as_object()?;
+    let item_type = object.get("type")?.as_str()?;
+    let prefix = responses_history_item_prefix(item_type)?;
+    let id = object.get("id")?.as_str()?;
+    if id.len() > prefix.len() && id.starts_with(prefix) {
+        return None;
+    }
+    let suffix = ["item_", "cp_", "resp_"]
+        .into_iter()
+        .chain([
+            "msg_", "rs_", "cmp_", "fc_", "fco_", "ctc_", "ctco_",
+        ])
+        .filter_map(|known| id.strip_prefix(known).map(|rest| (known.len(), rest)))
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, rest)| rest)
+        .filter(|rest| !rest.is_empty())
+        .or_else(|| object.get("call_id").and_then(Value::as_str).filter(|value| !value.is_empty()))
+        .unwrap_or(id);
+    Some(format!("{prefix}{suffix}"))
+}
+
+fn response_item_id_needs_rewrite(item: &Value) -> bool {
+    canonical_history_item_id(item).is_some()
+}
+
+fn rewrite_response_item_id(item: &mut Value) -> bool {
+    let Some(id) = canonical_history_item_id(item) else {
+        return false;
+    };
+    item["id"] = Value::String(id);
+    true
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct BulkRolloutFacts {
     session_meta_count: usize,
@@ -2228,6 +2308,7 @@ struct BulkRolloutFacts {
     rollout_marks_non_root_agent: bool,
     has_user_event: bool,
     has_encrypted_content: bool,
+    history_item_ids_need_rewrite: bool,
 }
 
 fn scan_bulk_rollout(
@@ -2257,6 +2338,14 @@ fn scan_bulk_rollout(
         let Some(record) = parse_record(record_line) else {
             continue;
         };
+        if record.get("type").and_then(Value::as_str) == Some("response_item") {
+            if let Some(payload) = record.get("payload") {
+                let needs_rewrite = response_item_id_needs_rewrite(payload);
+                facts.history_item_ids_need_rewrite |= needs_rewrite;
+                facts.rewrite_needed |= needs_rewrite;
+            }
+            continue;
+        }
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             continue;
         }
@@ -2276,6 +2365,7 @@ fn scan_bulk_rollout(
         );
         facts.rewrite_needed |=
             payload.get("model_provider").and_then(Value::as_str) != Some(target_provider);
+        facts.rewrite_needed |= facts.history_item_ids_need_rewrite;
         facts.rollout_marks_non_root_agent |=
             payload.get("source").is_some_and(source_value_marks_non_root_agent);
     }
@@ -2354,6 +2444,7 @@ fn scan_bulk_session_rewrites_with_parser(
         let BulkRolloutFacts {
             session_meta_count, thread_id, cwd, providers, original_session_meta_lines,
             rewrite_needed, rollout_marks_non_root_agent, has_user_event, has_encrypted_content,
+            history_item_ids_need_rewrite,
         } = facts;
 
         if session_meta_count > 0 {
@@ -2396,6 +2487,7 @@ fn scan_bulk_session_rewrites_with_parser(
                             .and_then(|metadata| metadata.modified())
                             .ok(),
                         original_session_meta_lines,
+                        history_item_ids_need_rewrite,
                     });
                 }
             }
@@ -3936,7 +4028,7 @@ fn create_bulk_backup(
     target_provider: &str,
     rewrite_plans: &[BulkSessionRewritePlan],
 ) -> anyhow::Result<PathBuf> {
-    create_backup_with_session_meta_lines(
+    let backup_dir = create_backup_with_session_meta_lines(
         home,
         target_provider,
         rewrite_plans.len(),
@@ -3946,7 +4038,19 @@ fn create_bulk_backup(
                 plan.original_session_meta_lines.as_slice(),
             )
         }),
-    )
+    )?;
+    for plan in rewrite_plans
+        .iter()
+        .filter(|plan| plan.history_item_ids_need_rewrite)
+    {
+        let relative = codex_plus_core::codex_sqlite::relative_to_codex_home(home, &plan.path);
+        let target = backup_dir.join("rollouts").join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&plan.path, target)?;
+    }
+    Ok(backup_dir)
 }
 
 fn create_backup_with_session_meta_lines<'a>(
@@ -4069,6 +4173,8 @@ impl<W: Write> Write for HashingWriter<W> {
 
 fn apply_bulk_session_rewrite_plans(
     rewrite_plans: &[BulkSessionRewritePlan],
+    backup_dir: &Path,
+    home: &Path,
     target_provider: &str,
     total_rollout_files: usize,
     scanned_skipped_rollout_files: usize,
@@ -4092,6 +4198,14 @@ fn apply_bulk_session_rewrite_plans(
                 applied.changes.push(AppliedBulkSessionRewrite {
                     plan: plan.clone(),
                     rewritten_sha256,
+                    full_backup_path: plan.history_item_ids_need_rewrite.then(|| {
+                        backup_dir
+                            .join("rollouts")
+                            .join(codex_plus_core::codex_sqlite::relative_to_codex_home(
+                                home,
+                                &plan.path,
+                            ))
+                    }),
                 });
             }
             Ok(None) => applied.skipped_locked_rollout_files.push(plan.path.clone()),
@@ -4205,14 +4319,22 @@ fn stream_rewrite_rollout_session_meta_providers<W: Write>(
         let mut rewritten = false;
         if !record_line.trim().is_empty()
             && let Ok(mut record) = serde_json::from_str::<Value>(record_line)
-            && record.get("type").and_then(Value::as_str) == Some("session_meta")
-            && let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut)
-            && payload.get("model_provider").and_then(Value::as_str) != Some(target_provider)
         {
-            payload.insert("model_provider".to_string(), json!(target_provider));
-            serde_json::to_writer(&mut *writer, &record).map_err(std::io::Error::other)?;
-            writer.write_all(line_ending.as_bytes())?;
-            rewritten = true;
+            if record.get("type").and_then(Value::as_str) == Some("session_meta")
+                && let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut)
+                && payload.get("model_provider").and_then(Value::as_str) != Some(target_provider)
+            {
+                payload.insert("model_provider".to_string(), json!(target_provider));
+                rewritten = true;
+            } else if record.get("type").and_then(Value::as_str) == Some("response_item")
+                && let Some(payload) = record.get_mut("payload")
+            {
+                rewritten = rewrite_response_item_id(payload);
+            }
+            if rewritten {
+                serde_json::to_writer(&mut *writer, &record).map_err(std::io::Error::other)?;
+                writer.write_all(line_ending.as_bytes())?;
+            }
         }
         if !rewritten {
             writer.write_all(line.as_bytes())?;
@@ -4244,6 +4366,23 @@ fn restore_bulk_session_rewrite(change: &AppliedBulkSessionRewrite) -> anyhow::R
             "rollout changed before rollback: {}",
             change.plan.path.display()
         ));
+    }
+
+    if let Some(backup_path) = change.full_backup_path.as_deref() {
+        let restore_result = codex_plus_core::settings::atomic_write_with(&change.plan.path, |file| {
+            let source = File::open(backup_path)?;
+            let mut reader = BufReader::new(source);
+            let mut writer = HashingWriter::new(BufWriter::new(file));
+            std::io::copy(&mut reader, &mut writer)?;
+            writer.flush()?;
+            Ok(())
+        });
+        restore_result?;
+        if sha256_file(&change.plan.path)? != change.plan.original_sha256 {
+            return Err(anyhow::anyhow!("rollout rollback hash mismatch"));
+        }
+        restore_file_mtime(&change.plan.path, change.plan.original_mtime);
+        return Ok(());
     }
 
     codex_plus_core::settings::atomic_write_with(&change.plan.path, |file| {
@@ -6053,6 +6192,55 @@ mod startup_scan_tests {
     use super::*;
 
     #[test]
+    fn history_item_ids_are_migrated_to_their_local_response_prefixes() {
+        let cases = [
+            (json!({"type":"message", "id":"item_message"}), "msg_message"),
+            (json!({"type":"reasoning", "id":"item_reasoning"}), "rs_reasoning"),
+            (json!({"type":"function_call", "id":"item_call"}), "fc_call"),
+            (
+                json!({"type":"function_call_output", "id":"item_output", "call_id":"call_123"}),
+                "fco_output",
+            ),
+            (
+                json!({"type":"custom_tool_call", "id":"cp_tool"}),
+                "ctc_tool",
+            ),
+        ];
+        for (mut item, expected_id) in cases {
+            assert!(response_item_id_needs_rewrite(&item));
+            assert!(rewrite_response_item_id(&mut item));
+            assert_eq!(item["id"], expected_id);
+        }
+
+        let mut canonical = json!({"type":"function_call_output", "id":"fco_call"});
+        assert!(!response_item_id_needs_rewrite(&canonical));
+        assert!(!rewrite_response_item_id(&mut canonical));
+        assert_eq!(canonical["id"], "fco_call");
+    }
+
+    #[test]
+    fn history_item_id_migration_does_not_change_call_id_or_opaque_content() {
+        let mut item = json!({
+            "type": "custom_tool_call",
+            "id": "item_tool",
+            "call_id": "call_tool",
+            "content": [{"type": "encrypted_content", "data": "opaque-bytes"}],
+        });
+        assert!(rewrite_response_item_id(&mut item));
+        assert_eq!(item["id"], "ctc_tool");
+        assert_eq!(item["call_id"], "call_tool");
+        assert_eq!(item["content"][0]["data"], "opaque-bytes");
+    }
+
+    #[test]
+    fn bulk_parser_selects_session_meta_and_response_items_only() {
+        let response = r#"{"type":"response_item","payload":{"type":"message","id":"item_1"}}"#;
+        assert!(parse_bulk_rewrite_record(response).is_some());
+        assert!(parse_bulk_rewrite_record(r#"{"type":"session_meta","payload":{}}"#).is_some());
+        assert!(parse_bulk_rewrite_record(r#"{"type":"event_msg","payload":{}}"#).is_none());
+    }
+
+    #[test]
     fn metadata_parser_matches_value_semantics_without_substring_guessing() {
         for line in [
             r#"{"type":"session_meta","payload":{"id":"t","model_provider":"old"}}"#,
@@ -6115,6 +6303,58 @@ mod startup_scan_tests {
         assert!(optimized.thread_ids_with_user_events.contains("explicit"));
         assert!(!optimized.thread_ids_with_user_events.contains("excluded"));
         assert!(optimized.subagent_thread_ids.contains("child"));
+    }
+
+    #[test]
+    fn scan_detects_history_only_rewrites_when_provider_is_already_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-history.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":"thread-1","model_provider":"openai"}}),
+                json!({"type":"response_item","payload":{"type":"message","id":"item_message","content":[{"type":"encrypted_content","data":"opaque"}]}}),
+            ),
+        )
+        .unwrap();
+
+        let scan = scan_bulk_session_rewrites(
+            temp.path(),
+            "openai",
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(scan.rewrite_plans.len(), 1);
+        assert!(scan.rewrite_plans[0].history_item_ids_need_rewrite);
+        assert_eq!(scan.rewrite_plans[0].original_session_meta_lines.len(), 1);
+    }
+
+    #[test]
+    fn stream_rewrite_migrates_history_ids_and_preserves_opaque_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout = temp.path().join("rollout.jsonl");
+        let original = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"thread-1","model_provider":"relay"}}),
+            json!({"type":"response_item","payload":{"type":"message","id":"item_message","call_id":"call_1","content":[{"type":"encrypted_content","data":"opaque"}]}}),
+        );
+        fs::write(&rollout, original).unwrap();
+
+        let mut rewritten = Vec::new();
+        stream_rewrite_rollout_session_meta_providers(&rollout, "openai", &mut rewritten).unwrap();
+        let lines = String::from_utf8(rewritten).unwrap();
+        let records = lines
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["payload"]["model_provider"], "openai");
+        assert_eq!(records[1]["payload"]["id"], "msg_message");
+        assert_eq!(records[1]["payload"]["call_id"], "call_1");
+        assert_eq!(records[1]["payload"]["content"][0]["data"], "opaque");
     }
 
     #[test]
@@ -6378,8 +6618,10 @@ mod rollback_tests {
                 original_sha256,
                 original_mtime: None,
                 original_session_meta_lines: vec![incorrect_meta.to_string()],
+                history_item_ids_need_rewrite: false,
             },
             rewritten_sha256,
+            full_backup_path: None,
         };
 
         let error = restore_bulk_session_rewrite(&change).unwrap_err();
